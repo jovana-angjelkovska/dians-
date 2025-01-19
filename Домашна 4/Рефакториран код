@@ -1,0 +1,172 @@
+import requests
+import pandas as pd
+from datetime import datetime, timedelta
+from tqdm import tqdm
+import numpy as np
+import ta
+from sklearn.preprocessing import MinMaxScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import LSTM, Dense
+import matplotlib.pyplot as plt
+import time
+
+class StockDataPipeline:
+    def __init__(self, symbol, start_date, end_date, base_url):
+        self.symbol = symbol
+        self.start_date = start_date
+        self.end_date = end_date
+        self.base_url = base_url
+        self.raw_data = None
+        self.cleaned_data = None
+        self.data_with_indicators = None
+        self.scaler = None
+
+    def fetch_data_for_date(self, date):
+        """
+        Fetches stock data for a specific date.
+
+        Args:
+            date (datetime): The date for which to fetch data.
+
+        Returns:
+            pd.DataFrame: DataFrame containing stock data for the given date.
+        """
+        url = f"{self.base_url}/{self.symbol}?date={date.strftime('%Y-%m-%d')}"
+        for attempt in range(3):
+            try:
+                response = requests.get(url, timeout=10)
+                if response.status_code == 200:
+                    return pd.read_html(response.content)[0]
+                else:
+                    print(f"Failed to fetch data for {date}: {response.status_code}")
+            except Exception as e:
+                print(f"Error fetching data for {date}: {e}")
+            time.sleep(1)
+        return pd.DataFrame()
+
+    def fetch_data_in_date_range(self):
+        """
+        Fetches stock data for the specified date range.
+        """
+        data_frames = []
+        for single_date in tqdm(pd.date_range(start=self.start_date, end=self.end_date), desc="Downloading data"):
+            daily_data = self.fetch_data_for_date(single_date)
+            if not daily_data.empty:
+                data_frames.append(daily_data)
+
+        if data_frames:
+            self.raw_data = pd.concat(data_frames, ignore_index=True)
+        else:
+            print("No data downloaded.")
+            self.raw_data = pd.DataFrame()
+
+    def clean_data(self):
+        """
+        Cleans and processes raw stock data.
+        """
+        if self.raw_data is None or self.raw_data.empty:
+            print("No raw data to clean.")
+            return
+
+        data = self.raw_data.dropna()
+        data.columns = data.columns.str.strip()
+        data['Date'] = pd.to_datetime(data['Date'], errors='coerce')
+        data = data.sort_values(by='Date').reset_index(drop=True)
+        self.cleaned_data = data
+
+    def calculate_technical_indicators(self):
+        """
+        Adds technical indicators (SMA, EMA, RSI, MACD) to the cleaned data.
+        """
+        if self.cleaned_data is None or self.cleaned_data.empty:
+            print("No cleaned data to calculate indicators.")
+            return
+
+        data = self.cleaned_data.copy()
+        data['SMA_20'] = data['Last trade price'].rolling(window=20).mean()
+        data['EMA_20'] = data['Last trade price'].ewm(span=20, adjust=False).mean()
+        data['RSI'] = ta.momentum.RSIIndicator(data['Last trade price'], window=14).rsi()
+        macd = ta.trend.MACD(data['Last trade price'])
+        data['MACD'] = macd.macd()
+        data['MACD_signal'] = macd.macd_signal()
+        self.data_with_indicators = data
+
+    def preprocess_for_lstm(self):
+        """
+        Prepares data for LSTM model training.
+        """
+        if self.data_with_indicators is None or self.data_with_indicators.empty:
+            print("No data to preprocess for LSTM.")
+            return None, None
+
+        self.scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = self.scaler.fit_transform(self.data_with_indicators[['Last trade price']])
+
+        X, y = [], []
+        for i in range(60, len(scaled_data)):
+            X.append(scaled_data[i - 60:i, 0])
+            y.append(scaled_data[i, 0])
+
+        X = np.array(X)
+        y = np.array(y)
+        X = np.reshape(X, (X.shape[0], X.shape[1], 1))
+        return X, y
+
+    @staticmethod
+    def create_lstm_model(input_shape):
+        """
+        Builds an LSTM model.
+        """
+        model = Sequential()
+        model.add(LSTM(units=50, return_sequences=True, input_shape=input_shape))
+        model.add(LSTM(units=50, return_sequences=False))
+        model.add(Dense(units=1))
+        model.compile(optimizer='adam', loss='mean_squared_error')
+        return model
+
+    @staticmethod
+    def plot_predictions(actual, predicted):
+        """
+        Plots actual vs predicted stock prices.
+        """
+        plt.figure(figsize=(10, 6))
+        plt.plot(actual, color='blue', label='Actual Prices')
+        plt.plot(predicted, color='red', label='Predicted Prices')
+        plt.title('Stock Price Prediction')
+        plt.xlabel('Time')
+        plt.ylabel('Price')
+        plt.legend()
+        plt.show()
+
+    def run(self):
+        """
+        Executes the complete data processing and LSTM workflow.
+        """
+        self.fetch_data_in_date_range()
+        self.clean_data()
+        self.calculate_technical_indicators()
+
+        X, y = self.preprocess_for_lstm()
+        if X is None or y is None:
+            return
+
+        train_size = int(len(X) * 0.8)
+        X_train, X_test = X[:train_size], X[train_size:]
+        y_train, y_test = y[:train_size], y[train_size:]
+
+        model = self.create_lstm_model((X_train.shape[1], 1))
+        model.fit(X_train, y_train, epochs=10, batch_size=32)
+
+        predictions = model.predict(X_test)
+        predictions = self.scaler.inverse_transform(predictions)
+        actual_prices = self.scaler.inverse_transform(y_test.reshape(-1, 1))
+        self.plot_predictions(actual_prices, predictions)
+
+if __name__ == "__main__":
+    pipeline = StockDataPipeline(
+        symbol="REPL",  # Replace with the desired symbol
+        start_date=datetime(2014, 1, 1),
+        end_date=datetime(2024, 10, 31),
+        base_url="https://www.mse.mk/daily/stats/symbolhistory"
+    )
+    pipeline.run()
